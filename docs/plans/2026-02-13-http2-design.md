@@ -907,41 +907,95 @@ Following existing conventions:
 
 ---
 
-## 15. Load Testing
+## 15. Load Testing and Benchmarking Framework
+
+### Current State
+
+The `load-tests/` directory currently has:
+- **`self/`** — java-http load test server (LoadHandler with 5 endpoints: no-op, no-read, hello, file, load)
+- **`tomcat/`** — Apache Tomcat 8.5.72 with equivalent LoadServlet
+- **`netty/`** — placeholder only, not implemented
+- **`docker/ab/`** — Apache Bench Docker image
+- **`benchmarks/`** — manual benchmark results in markdown
+
+The README lists Netty, OkHttp, and JDK HttpServer as "?" (not yet tested). The existing Restify-based load test lives in a separate repo (`fusionauth-load-tests`).
+
+### Vision: Automated Benchmark Suite
+
+The goal is a self-contained, reproducible benchmark suite that:
+1. Tests java-http against multiple competing servers with identical workloads
+2. Supports both HTTP/1.1 and HTTP/2 workloads
+3. Produces structured, machine-readable results with system metadata
+4. Auto-generates README updates with the latest results
+5. Can be run locally via a single Savant target
+6. Optionally runnable via GitHub Actions (manually triggered)
 
 ### Tool: h2load (nghttp2)
 
 `h2load` is the standard HTTP/2 benchmarking tool, part of the nghttp2 project. It supports:
 - HTTP/2 over TLS (h2) and plaintext (h2c)
+- HTTP/1.1 via `--h1` flag (can replace Apache Bench for consistency)
 - Configurable concurrent streams, connections, and requests
-- Latency statistics
+- Latency statistics (min, max, mean, stdev, percentiles)
 - Throughput measurement
+- Machine-readable output (can parse stdout)
 
-### Load Test Plan
+Using `h2load` for both HTTP/1.1 and HTTP/2 benchmarks gives us a consistent measurement tool across protocols.
 
-Extend the existing `load-tests/` directory:
+### Vendor Server Implementations
 
-```
-load-tests/
-  self/
-    src/main/java/io/fusionauth/http/load/
-      Main.java          # Modified to log protocol version
-      LoadHandler.java   # Unchanged (protocol-agnostic)
-  h2load/
-    run-h2-benchmark.sh  # h2load benchmark script
-    run-h1-benchmark.sh  # HTTP/1.1 baseline (existing ab or h2load --h1)
-```
+#### Currently Implemented
+
+| Server | Status | Directory | Notes |
+|---|---|---|---|
+| java-http | Working | `load-tests/self/` | LoadHandler with 5 endpoints |
+| Apache Tomcat | Working | `load-tests/tomcat/` | Tomcat 8.5.72 with LoadServlet |
+
+#### To Be Implemented
+
+| Server | Directory | Effort | Notes |
+|---|---|---|---|
+| Netty | `load-tests/netty/` | ~1 day | Placeholder exists. Need Netty server with equivalent handler. |
+| JDK HttpServer | `load-tests/jdk-httpserver/` | ~0.5 day | `com.sun.net.httpserver.HttpServer`. Simple to set up. Educational comparison. |
+| Jetty | `load-tests/jetty/` | ~0.5 day | Jetty embedded server. Strong HTTP/2 support for comparison. |
+
+**Note**: OkHttp is an HTTP client library, not a server — it shouldn't be in the server benchmark table. The README should be corrected.
+
+Each vendor implementation follows the same pattern:
+- `build.savant` — build config with vendor dependency
+- `src/main/java/io/fusionauth/http/load/` — equivalent handler (same 5 endpoints)
+- `start.sh` — startup script on port 8080
+
+#### HTTP/2 Support Per Vendor
+
+| Server | HTTP/2 Support | h2c Support | Notes |
+|---|---|---|---|
+| java-http | Adding (this spec) | Adding | Primary subject |
+| Tomcat | Yes (8.5+) | Yes | Upgrade Tomcat to 10.x for modern HTTP/2 |
+| Netty | Yes | Yes | Via `Http2ServerUpgradeCodec` |
+| JDK HttpServer | No | No | HTTP/1.1 only — exclude from HTTP/2 benchmarks |
+| Jetty | Yes (9.3+) | Yes | Strong HTTP/2 via `HTTP2CServerConnectionFactory` |
 
 ### Benchmark Scenarios
 
+#### HTTP/1.1 Benchmarks (baseline, all vendors)
+
 | Scenario | Tool | Configuration | Purpose |
 |---|---|---|---|
-| HTTP/2 baseline | h2load | 100 clients, 100K req, 1 stream/conn | Compare to HTTP/1.1 baseline |
-| HTTP/2 multiplexing | h2load | 10 clients, 100 streams/conn, 100K req | Measure multiplexing benefit |
-| HTTP/2 large response | h2load | 10 clients, 1MB responses | Verify flow control under load |
-| HTTP/2 vs HTTP/1.1 | h2load | Same parameters, --h1 flag | Direct comparison |
-| HTTP/2 vs Tomcat | h2load | Same parameters | Competitive benchmark |
-| HTTP/2 TLS | h2load | Same as baseline, over TLS | TLS + HTTP/2 overhead |
+| No-op (keep-alive) | h2load | 100 conn, 100K req, --h1 | Baseline throughput |
+| Hello world | h2load | 100 conn, 100K req, --h1, `/hello` | Small response body |
+| Large file (1MB) | h2load | 10 conn, 5K req, --h1, `/file?size=1048576` | Throughput with large payloads |
+| High concurrency | h2load | 1000 conn, 10K req, --h1 | Connection handling under pressure |
+
+#### HTTP/2 Benchmarks (HTTP/2-capable vendors only)
+
+| Scenario | Tool | Configuration | Purpose |
+|---|---|---|---|
+| HTTP/2 baseline | h2load | 100 conn, 100K req, 1 stream/conn | Compare to HTTP/1.1 baseline |
+| Multiplexing (10 streams) | h2load | 10 conn, 100 streams/conn, 100K req | Measure multiplexing benefit |
+| Multiplexing (100 streams) | h2load | 10 conn, 100 streams/conn, 100K req | High multiplexing |
+| Large response | h2load | 10 conn, 5K req, `/file?size=1048576` | Flow control under load |
+| HTTP/2 + TLS | h2load | Same as baseline, h2 over TLS | TLS + HTTP/2 overhead |
 
 ### Performance Targets
 
@@ -949,6 +1003,206 @@ load-tests/
 - HTTP/2 multiplexed throughput should exceed HTTP/1.1 keep-alive for concurrent requests
 - Zero failed requests under sustained load
 - Latency should not regress compared to HTTP/1.1
+
+### Structured Output Format
+
+Benchmark results are stored as JSON for historical comparison:
+
+```json
+{
+  "version": 1,
+  "timestamp": "2026-02-15T14:30:00Z",
+  "system": {
+    "os": "macOS 15.2",
+    "arch": "arm64",
+    "cpuModel": "Apple M4 Max",
+    "cpuCores": 16,
+    "ramGB": 64,
+    "javaVersion": "21.0.5",
+    "description": "Dan's dev laptop, 2025 MacBook Pro"
+  },
+  "tool": {
+    "name": "h2load",
+    "version": "1.62.0"
+  },
+  "results": [
+    {
+      "server": "java-http",
+      "serverVersion": "1.5.0",
+      "protocol": "h2c",
+      "scenario": "baseline",
+      "config": {
+        "connections": 100,
+        "requests": 100000,
+        "streams": 1,
+        "endpoint": "/"
+      },
+      "metrics": {
+        "totalRequests": 100000,
+        "successfulRequests": 100000,
+        "failedRequests": 0,
+        "requestsPerSecond": 105000.5,
+        "avgLatencyMs": 0.32,
+        "p50LatencyMs": 0.28,
+        "p90LatencyMs": 0.45,
+        "p99LatencyMs": 1.12,
+        "maxLatencyMs": 5.43,
+        "totalDurationMs": 952.4
+      }
+    }
+  ]
+}
+```
+
+**System metadata collection:**
+- CPU model, core count, RAM: auto-detected via Java's `Runtime` and OS-specific commands (`sysctl` on macOS, `/proc/cpuinfo` on Linux)
+- Java version: `System.getProperty("java.version")`
+- User-provided description: prompted at run time (e.g., "Dan's dev laptop, 2025 MacBook Pro M4 Max")
+
+**File naming convention:**
+```
+load-tests/results/
+  2026-02-15-baseline-dans-macbook.json
+  2026-02-20-baseline-gha-runner.json
+  2026-03-01-http2-dans-macbook.json
+```
+
+Results are committed to the repo so they can be compared over time. The file name includes date, scenario type, and a machine identifier.
+
+### Auto-Generated README Updates
+
+A script parses the latest results JSON and generates a markdown table for the README:
+
+```
+## Performance
+
+> Last benchmarked: 2026-02-15 on Dan's dev laptop (Apple M4 Max, 16 cores, 64GB RAM)
+
+### HTTP/1.1 (h2load, 100 connections, 100K requests)
+
+| Server         | Requests/sec | Avg latency (ms) | P99 latency (ms) | Failures | Normalized |
+|----------------|-------------|-------------------|-------------------|----------|------------|
+| java-http      | 101,317     | 0.350             | 1.12              | 0        | 100%       |
+| Apache Tomcat  | 83,463      | 0.702             | 2.45              | 0        | 82.3%      |
+| Jetty          | 89,200      | 0.520             | 1.89              | 0        | 88.1%      |
+| Netty          | 95,100      | 0.410             | 1.55              | 0        | 93.9%      |
+
+### HTTP/2 (h2load, 100 connections, 10 streams/conn, 100K requests)
+
+| Server         | Requests/sec | Avg latency (ms) | P99 latency (ms) | Failures | Normalized |
+|----------------|-------------|-------------------|-------------------|----------|------------|
+| java-http      | ...         | ...               | ...               | ...      | 100%       |
+| ...            |             |                   |                   |          |            |
+```
+
+### Benchmark Runner Script
+
+A single script (`load-tests/run-benchmarks.sh`) orchestrates the full benchmark suite:
+
+```
+Usage: ./run-benchmarks.sh [OPTIONS]
+
+Options:
+  --servers    Comma-separated list of servers to test (default: all)
+  --scenarios  Comma-separated list of scenarios (default: all)
+  --protocol   h1, h2, or all (default: all)
+  --label      Machine description for results (prompted if not provided)
+  --output     Output directory for results JSON (default: load-tests/results/)
+  --update-readme  Auto-update README.md with latest results (default: false)
+```
+
+The script:
+1. Collects system metadata (auto-detected + user-provided label)
+2. For each server: starts the server, waits for ready, runs h2load scenarios, stops the server
+3. Aggregates results into a single JSON file
+4. Optionally updates the README benchmark table
+
+### Savant Integration
+
+Add a benchmark target to the root `build.savant`:
+
+```groovy
+target(name: "benchmark", description: "Run the full benchmark suite") {
+  // Delegates to run-benchmarks.sh
+}
+```
+
+This allows running benchmarks with: `sb benchmark`
+
+### GitHub Actions (Manual Trigger)
+
+A GHA workflow with `workflow_dispatch` allows manual triggering:
+
+```yaml
+name: Benchmark
+on:
+  workflow_dispatch:
+    inputs:
+      servers:
+        description: 'Servers to benchmark (comma-separated, or "all")'
+        default: 'all'
+      scenarios:
+        description: 'Scenarios to run'
+        default: 'all'
+```
+
+**Caveats**: GHA runners have variable performance characteristics (shared hardware, noisy neighbors). GHA results are useful for:
+- Detecting gross regressions (>20% degradation)
+- Verifying no failures under load
+- Automated smoke testing of the benchmark infrastructure
+
+GHA results should NOT be used for:
+- Precise performance comparisons between servers
+- Marketing claims
+- Latency percentile analysis
+
+The results JSON will include `"system.description": "GitHub Actions runner"` so GHA results are clearly identified and not confused with bare-metal results.
+
+### Load Test Directory Structure (Planned)
+
+```
+load-tests/
+  run-benchmarks.sh              # Main orchestrator script
+  update-readme.sh               # Parses results, updates README
+  results/                       # Historical JSON results (committed)
+    2026-02-15-baseline-*.json
+  self/                          # java-http (existing, enhanced)
+    build.savant
+    src/main/java/io/fusionauth/http/load/
+      Main.java                  # Enhanced: HTTP/2 support, system info
+      LoadHandler.java           # Unchanged (protocol-agnostic)
+  tomcat/                        # Apache Tomcat (existing, upgrade to 10.x)
+    build.savant
+    src/main/java/io/fusionauth/http/load/
+      LoadServlet.java
+  netty/                         # Netty (new)
+    build.savant
+    src/main/java/io/fusionauth/http/load/
+      NettyLoadServer.java
+  jetty/                         # Jetty (new)
+    build.savant
+    src/main/java/io/fusionauth/http/load/
+      JettyLoadServer.java
+  jdk-httpserver/                # JDK HttpServer (new)
+    build.savant
+    src/main/java/io/fusionauth/http/load/
+      JdkLoadServer.java
+```
+
+### Implementation Effort
+
+| Component | Effort |
+|---|---|
+| Netty load test server | 1 day |
+| Jetty load test server | 0.5 day |
+| JDK HttpServer load test server | 0.5 day |
+| Benchmark runner script (run-benchmarks.sh) | 1-2 days |
+| JSON output format + system metadata collection | 0.5 day |
+| README auto-updater script | 0.5 day |
+| Tomcat upgrade to 10.x for HTTP/2 | 0.5 day |
+| java-http HTTP/2 load test config | 0.5 day |
+| GHA workflow | 0.5 day |
+| **Total** | **~5-7 days** |
 
 ---
 
@@ -1573,12 +1827,9 @@ All phases ship together in a single release. Phases are for development orderin
 
 ### Phase 6: Load Testing and Optimization (~1 week)
 
-22. **h2load benchmark scripts**
-23. **Benchmark: HTTP/2 vs HTTP/1.1**
-24. **Benchmark: java-http HTTP/2 vs Tomcat HTTP/2**
-25. **Performance profiling and optimization**
-26. **Frame writer optimization** (queue vs lock, based on profiling)
-27. **Update load-tests/ directory**
+22. **HTTP/2 performance profiling and optimization**
+23. **Frame writer optimization** (queue vs lock, based on profiling)
+24. **HTTP/2 load test configuration** in `load-tests/self/Main.java` (add HTTP/2 listener)
 
 ### Phase 7: Upgrade Mechanism and WebSocket (~2 weeks)
 
@@ -1607,6 +1858,28 @@ All phases ship together in a single release. Phases are for development orderin
     - Close handshake and error handling tests
     - Concurrent connection load tests
     - h2c Upgrade integration tests
+
+### Phase 8: Benchmark Framework (~1 week)
+
+31. **Benchmark runner script** (`run-benchmarks.sh`) (~1-2 days)
+    - System metadata auto-detection (CPU, cores, RAM, OS, Java version)
+    - User-provided machine description prompt
+    - Server start/stop orchestration
+    - h2load execution and output parsing
+    - JSON results file generation
+
+32. **Vendor server implementations** (~2 days)
+    - Netty load test server (`load-tests/netty/`)
+    - Jetty load test server (`load-tests/jetty/`)
+    - JDK HttpServer load test server (`load-tests/jdk-httpserver/`)
+    - Upgrade Tomcat to 10.x for HTTP/2 support
+    - Remove OkHttp from README (it's a client library, not a server)
+
+33. **README auto-updater and GHA** (~1-2 days)
+    - Script to parse results JSON and generate README markdown table
+    - Savant `benchmark` target for local execution
+    - GitHub Actions workflow with `workflow_dispatch` for manual triggering
+    - Results committed to `load-tests/results/` for historical comparison
 
 ---
 
@@ -1684,6 +1957,21 @@ All phases ship together in a single release. Phases are for development orderin
 | `ws/WebSocketErrorTest.java` | Invalid frames, protocol violations |
 | `ws/WebSocketLoadTest.java` | Many concurrent connections |
 | `http2/HTTP2UpgradeTest.java` | h2c Upgrade via 101 Switching Protocols |
+
+### New Load Test Files
+
+| File | Purpose |
+|---|---|
+| `load-tests/run-benchmarks.sh` | Main benchmark orchestrator script |
+| `load-tests/update-readme.sh` | Parses results JSON, updates README performance table |
+| `load-tests/results/*.json` | Historical benchmark results (committed) |
+| `load-tests/netty/build.savant` | Netty load test build config |
+| `load-tests/netty/src/.../NettyLoadServer.java` | Netty equivalent of LoadHandler |
+| `load-tests/jetty/build.savant` | Jetty load test build config |
+| `load-tests/jetty/src/.../JettyLoadServer.java` | Jetty equivalent of LoadHandler |
+| `load-tests/jdk-httpserver/build.savant` | JDK HttpServer build config |
+| `load-tests/jdk-httpserver/src/.../JdkLoadServer.java` | JDK HttpServer equivalent of LoadHandler |
+| `.github/workflows/benchmark.yml` | Manual-trigger GHA for benchmarks |
 
 ---
 
